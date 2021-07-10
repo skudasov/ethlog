@@ -1,4 +1,4 @@
-module ethlog
+module github.com/skudasov/ethlog
 
 go 1.16
 
