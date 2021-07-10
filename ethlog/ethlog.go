@@ -134,6 +134,9 @@ func (e *EthLog) mergeLogMeta(m ParsedEvent, l types.Log) {
 func (e *EthLog) parseTxInputs(tx *types.Transaction, a abi.ABI) (map[string]interface{}, error) {
 	inputMap := make(map[string]interface{})
 	input := tx.Data()
+	if len(input) == 0 {
+		return nil, nil
+	}
 	// recover Method from signature and ABI
 	method, err := a.MethodById(input[:4])
 	if err != nil {
@@ -152,6 +155,9 @@ func (e *EthLog) parseTxInputs(tx *types.Transaction, a abi.ABI) (map[string]int
 func (e *EthLog) parseTxOutputs(tx *types.Transaction, a abi.ABI) (map[string]interface{}, error) {
 	outputMap := make(map[string]interface{})
 	input := tx.Data()
+	if len(input) == 0 {
+		return nil, nil
+	}
 	// recover Method from signature and ABI
 	method, err := a.MethodById(input[:4])
 	if err != nil {
