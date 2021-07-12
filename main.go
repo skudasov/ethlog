@@ -1,12 +1,11 @@
 package main
 
 import (
-	"ethlog/ethlog"
-	"ethlog/events_test_contract"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/skudasov/ethlog/ethlog"
+	"github.com/skudasov/ethlog/events_test_contract"
 	"log"
-	"math/big"
 )
 
 func main() {
@@ -16,15 +15,13 @@ func main() {
 	}
 	e := ethlog.NewEthLog(client)
 	cfg := &ethlog.BlockHistoryConfig{
-		FromBlock: big.NewInt(100),
-		ToBlock:   big.NewInt(200),
-		Format:    ethlog.FormatJSON,
-		Rewrite:   true,
+		Format:  ethlog.FormatYAML,
+		Rewrite: true,
 		ContractsData: []ethlog.ContractData{
 			{
 				Name:    "eventTestContract",
 				ABI:     events_test_contract.EventsTestContractABI,
-				Address: common.HexToAddress("0x0"), // contract address
+				Address: common.HexToAddress("0xa513E6E4b8f2a923D98304ec87F64353C4D5C853"), // contract address
 			},
 		},
 	}
