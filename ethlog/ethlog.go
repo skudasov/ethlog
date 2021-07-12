@@ -438,7 +438,7 @@ func (e *EthLog) formatYAML(history interface{}) ([]byte, error) {
 
 // parseContractEvents parses all events related to contract addr
 func (e *EthLog) parseContractEvents(logs []types.Log, a abi.ABI, bh *BlockHistoryConfig) ([]ParsedEvent, error) {
-	e.L.Info().
+	e.L.Debug().
 		Int64("from_block", bh.FromBlock.Int64()).
 		Int64("to_block", bh.ToBlock.Int64()).
 		Msg("parsing events")
