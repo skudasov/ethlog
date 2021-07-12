@@ -26,7 +26,4 @@ artifacts/
 
 # JUnit Test Reports
 junit.xml
-abi/
-another_events_test_contract/
-events_test_contract/
 bin/
