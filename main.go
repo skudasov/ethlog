@@ -3,6 +3,7 @@ package main
 import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/rs/zerolog"
 	"github.com/skudasov/ethlog/ethlog"
 	"github.com/skudasov/ethlog/events_test_contract"
 	"log"
@@ -13,7 +14,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	e := ethlog.NewEthLog(client)
+	e := ethlog.NewEthLog(client, zerolog.DebugLevel)
 	cfg := &ethlog.BlockHistoryConfig{
 		Format:  ethlog.FormatYAML,
 		Rewrite: true,

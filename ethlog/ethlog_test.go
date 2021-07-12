@@ -1,10 +1,10 @@
 package ethlog
 
 import (
-	"ethlog/events_test_contract"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/skudasov/ethlog/events_test_contract"
 	"github.com/stretchr/testify/require"
 	"math/big"
 	"os"
@@ -23,7 +23,7 @@ type SimulatedTestSuite struct {
 
 func NewSimulatedTestSuite() *SimulatedTestSuite {
 	ss := NewSimulatedBackend()
-	e := NewEthLog(ss.Client)
+	e := NewEthLog(ss.Client, zerolog.DebugLevel)
 	c := DeployTestContractsLocal(ss)
 	sts := &SimulatedTestSuite{
 		ss: ss,

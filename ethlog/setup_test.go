@@ -3,14 +3,14 @@ package ethlog
 import (
 	"context"
 	"crypto/ecdsa"
-	"ethlog/another_events_test_contract"
-	"ethlog/events_test_contract"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
+	"github.com/skudasov/ethlog/another_events_test_contract"
+	"github.com/skudasov/ethlog/events_test_contract"
 	"math/big"
 )
 
