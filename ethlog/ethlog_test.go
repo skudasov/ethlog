@@ -24,7 +24,7 @@ type SimulatedTestSuite struct {
 
 func NewSimulatedTestSuite() *SimulatedTestSuite {
 	ss := NewSimulatedBackend()
-	e := NewEthLog(ss.Client)
+	e := NewEthLog(ss.Client, 1000)
 	c := DeployTestContractsLocal(ss)
 	sts := &SimulatedTestSuite{
 		ss: ss,
@@ -41,8 +41,7 @@ func (ss *SimulatedTestSuite) commit() {
 
 func defaultCfg(contractAddr common.Address) *HistoryConfig {
 	return &HistoryConfig{
-		Format:  FormatJSON,
-		Rewrite: true,
+		Format: FormatJSON,
 		ContractsData: []ContractData{
 			{
 				Name:    "eventTestContract",
@@ -140,9 +139,8 @@ func TestEthlog(t *testing.T) {
 		ss.commit()
 
 		cfg := defaultCfg(ss.c.AddrStore)
-		historyResult, err := ss.e.History(cfg)
-		require.NoError(t, err)
-		err = ss.e.DumpBlockHistory("example_history_simulated", cfg, historyResult)
+		cfg.OutputFile = "tmp_history"
+		_, err := ss.e.History(cfg)
 		require.NoError(t, err)
 	})
 }
