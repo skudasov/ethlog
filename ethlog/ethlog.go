@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"math/big"
+	"net/http"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -13,24 +16,45 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"go.uber.org/ratelimit"
+	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v2"
 )
 
 func init() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+
+	http.Handle("/metrics", promhttp.Handler())
+	// nolint
+	go http.ListenAndServe(":2222", nil)
 }
 
+var (
+	getReceiptHist = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name: "get_receipt",
+		Help: "TX Receipt response time",
+	})
+	getBlockHist = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name: "get_block",
+		Help: "Get Block response time",
+	})
+)
+
 type ParsedTX struct {
-	Hash      string                 `json:"hash"`
-	Protected bool                   `json:"protected"`
-	Input     map[string]interface{} `json:"input,omitempty"`
-	Output    map[string]interface{} `json:"output,omitempty"`
-	Receipt   *types.Receipt         `json:"receipt,omitempty"`
-	Events    []ParsedEvent          `json:"events,omitempty"`
+	ParseError string                 `json:"parse_error,omitempty"`
+	Index      uint                   `json:"index"`
+	Hash       string                 `json:"hash,omitempty"`
+	Protected  bool                   `json:"protected,omitempty"`
+	Input      map[string]interface{} `json:"input,omitempty"`
+	Output     map[string]interface{} `json:"output,omitempty"`
+	Receipt    *types.Receipt         `json:"receipt,omitempty"`
+	Events     []ParsedEvent          `json:"events,omitempty"`
 }
 
 type ParsedBlock struct {
@@ -52,6 +76,7 @@ type History struct {
 type HistoryFormat int
 
 type ParsedEvent struct {
+	Signature   string                 `json:"signature"`
 	Address     common.Address         `json:"address"`
 	EventData   map[string]interface{} `json:"event_data"`
 	Topics      []string               `json:"topics,omitempty"`
@@ -82,6 +107,7 @@ func mergeEventTopicsMap(eventsMap map[string]interface{}, topicsMap map[string]
 
 type EthLog struct {
 	client EthClient
+	rl     ratelimit.Limiter
 	ABIS   []abi.ABI
 }
 
@@ -89,7 +115,7 @@ type HistoryConfig struct {
 	FromBlock     *big.Int
 	ToBlock       *big.Int
 	Format        HistoryFormat
-	Rewrite       bool
+	OutputFile    string
 	ContractsData []ContractData
 }
 
@@ -114,15 +140,16 @@ type EthClient interface {
 	LatestBlockNumber
 }
 
-func NewEthLog(client EthClient) *EthLog {
+func NewEthLog(client EthClient, rpsLimit int) *EthLog {
 	return &EthLog{
 		client: client,
 		ABIS:   make([]abi.ABI, 0),
+		rl:     ratelimit.New(rpsLimit),
 	}
 }
 
 // mergeLogMeta add metadata from log
-func (e *EthLog) mergeLogMeta(m ParsedEvent, l types.Log) {
+func (e *EthLog) mergeLogMeta(m *ParsedEvent, l types.Log) {
 	m.Address = l.Address
 	m.Topics = make([]string, 0)
 	for _, t := range l.Topics {
@@ -136,44 +163,25 @@ func (e *EthLog) mergeLogMeta(m ParsedEvent, l types.Log) {
 }
 
 // parseTxInputs parses tx inputs
-func (e *EthLog) parseTxInputs(tx *types.Transaction, a abi.ABI) (map[string]interface{}, error) {
+func (e *EthLog) parseTxInputs(txData []byte, method *abi.Method) (map[string]interface{}, error) {
+	log.Debug().Msg("Parsing tx inputs")
 	inputMap := make(map[string]interface{})
-	input := tx.Data()
-	if len(input) == 0 {
-		return nil, nil
-	}
-	// recover Method from signature and ABI
-	method, err := a.MethodById(input[:4])
+	err := method.Inputs.UnpackIntoMap(inputMap, txData[4:])
 	if err != nil {
-		return nil, err
+		log.Error().Err(err).Send()
 	}
-	// unpack method inputs
-	err = method.Inputs.UnpackIntoMap(inputMap, input[4:])
-	if err != nil {
-		return nil, err
-	}
-	log.Debug().Interface("map", inputMap).Msg("parsed input")
 	return inputMap, nil
 }
 
 // parseTxOutputs parses tx outputs
-func (e *EthLog) parseTxOutputs(tx *types.Transaction, a abi.ABI) (map[string]interface{}, error) {
+func (e *EthLog) parseTxOutputs(txData []byte, method *abi.Method) (map[string]interface{}, error) {
+	log.Debug().Msg("Parsing tx outputs")
 	outputMap := make(map[string]interface{})
-	input := tx.Data()
-	if len(input) == 0 {
-		return nil, nil
-	}
-	// recover Method from signature and ABI
-	method, err := a.MethodById(input[:4])
-	if err != nil {
-		return nil, err
-	}
 	// unpack method outputs
-	err = method.Outputs.UnpackIntoMap(outputMap, input[4:])
+	err := method.Outputs.UnpackIntoMap(outputMap, txData[4:])
 	if err != nil {
-		return nil, err
+		log.Error().Err(err).Send()
 	}
-	log.Debug().Interface("map", outputMap).Msg("parsed output")
 	return outputMap, nil
 }
 
@@ -189,84 +197,143 @@ func (e *EthLog) SetABI(bh *HistoryConfig) error {
 	return nil
 }
 
+func (e *EthLog) parseTX(tx *types.Transaction, bh *HistoryConfig) (ParsedTX, error) {
+	var txInput map[string]interface{}
+	var txOutput map[string]interface{}
+	var txEvents []ParsedEvent
+	var err error
+	e.rl.Take()
+	before := time.Now()
+	receipt, err := e.client.TransactionReceipt(context.Background(), tx.Hash())
+	if err != nil {
+		return ParsedTX{}, err
+	}
+	getReceiptHist.Observe(float64(time.Since(before).Milliseconds()))
+	txData := tx.Data()
+	// if there is no input data hence no events
+	if len(txData) == 0 {
+		return ParsedTX{
+			Index:   receipt.TransactionIndex,
+			Receipt: receipt,
+		}, nil
+	}
+	// parse inputs and events
+	for _, cd := range bh.ContractsData {
+		// check if we have that method in that ABI
+		method, err := cd.ABIInstance.MethodById(txData[:4])
+		if err != nil {
+			log.Debug().Msg("Method not found")
+			continue
+		}
+		txInput, err = e.parseTxInputs(txData, method)
+		if err != nil {
+			return ParsedTX{}, err
+		}
+		txOutput, err = e.parseTxOutputs(txData, method)
+		if err != nil {
+			return ParsedTX{}, err
+		}
+		if receipt != nil {
+			log.Debug().Interface("receipt", receipt).Msg("tx receipt")
+			logsValues := make([]types.Log, 0)
+			for _, l := range receipt.Logs {
+				logsValues = append(logsValues, *l)
+			}
+			txEvents, err = e.parseContractEvents(logsValues, cd.ABIInstance)
+			if err != nil {
+				return ParsedTX{}, err
+			}
+		}
+	}
+	log.Debug().Interface("Inputs", txInput).Msg("Inputs collected")
+	log.Debug().Interface("Outputs", txOutput).Msg("Outputs collected")
+	log.Debug().Interface("Events", txEvents).Msg("Events collected")
+	return ParsedTX{
+		Index:     receipt.TransactionIndex,
+		Protected: tx.Protected(),
+		Hash:      tx.Hash().String(),
+		Input:     txInput,
+		Output:    txOutput,
+		Receipt:   receipt,
+		Events:    txEvents,
+	}, nil
+}
+
+func (e *EthLog) orderHistory(h *History) {
+	sort.Slice(h.Blocks, func(i, j int) bool {
+		return h.Blocks[i].Number.Int64() < h.Blocks[j].Number.Int64()
+	})
+	for _, block := range h.Blocks {
+		sort.Slice(block.Transactions, func(i, j int) bool {
+			return block.Transactions[i].Index < block.Transactions[j].Index
+		})
+	}
+}
+
 // History parses all blocks with inputs/outputs, receipts and events for all contracts
 func (e *EthLog) History(bh *HistoryConfig) (*History, error) {
 	if err := e.prepare(bh); err != nil {
 		return nil, err
 	}
 	history := &History{}
+	bmu := &sync.Mutex{}
+	beg := errgroup.Group{}
 	for i := bh.FromBlock.Int64(); i < bh.ToBlock.Int64(); i++ {
-		b, err := e.client.BlockByNumber(context.Background(), big.NewInt(i))
-		if err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				log.Err(err).Msg("missing block")
+		i := i
+		beg.Go(func() error {
+			log.Info().Int64("Number", i).Msg("Parsing block")
+			e.rl.Take()
+			tn := time.Now()
+			b, err := e.client.BlockByNumber(context.Background(), big.NewInt(i))
+			if err != nil {
+				if strings.Contains(err.Error(), "not found") {
+					log.Err(err).Msg("missing block")
+				}
+				return err
 			}
+			getBlockHist.Observe(float64(time.Since(tn).Milliseconds()))
+			parsedBlock := ParsedBlock{
+				Number:            b.Number(),
+				Hash:              b.Hash().String(),
+				TransactionsCount: b.Transactions().Len(),
+				GasLimit:          b.GasLimit(),
+				GasUsed:           b.GasUsed(),
+				Time:              b.Time(),
+				ReceivedAt:        b.ReceivedAt,
+			}
+			mu := &sync.Mutex{}
+			eg := errgroup.Group{}
+			for _, tx := range b.Transactions() {
+				tx := tx
+				eg.Go(func() error {
+					parsedTx, err := e.parseTX(tx, bh)
+					if err != nil {
+						return err
+					}
+					mu.Lock()
+					parsedBlock.Transactions = append(parsedBlock.Transactions, parsedTx)
+					mu.Unlock()
+					return nil
+				})
+			}
+			if err := eg.Wait(); err != nil {
+				return err
+			}
+			bmu.Lock()
+			history.Blocks = append(history.Blocks, parsedBlock)
+			bmu.Unlock()
+			return nil
+		})
+	}
+	if err := beg.Wait(); err != nil {
+		return nil, err
+	}
+	e.orderHistory(history)
+	if bh.OutputFile != "" {
+		if err := e.writeBlockHistory(bh.OutputFile, bh.Format, history); err != nil {
 			return nil, err
 		}
-		parsedBlock := ParsedBlock{
-			Number:            b.Number(),
-			Hash:              b.Hash().String(),
-			TransactionsCount: b.Transactions().Len(),
-			GasLimit:          b.GasLimit(),
-			GasUsed:           b.GasUsed(),
-			Time:              b.Time(),
-			ReceivedAt:        b.ReceivedAt,
-		}
-		log.Debug().Str("block", b.Hash().Hex()).Int64("bn", b.Number().Int64()).Msg("block")
-		log.Debug().Interface("parsedBlock", parsedBlock).Msg("parsed block map")
-		parsedTxs := make([]ParsedTX, 0)
-		for _, tx := range b.Transactions() {
-			var txInput map[string]interface{}
-			var txOutput map[string]interface{}
-			var txReceipt *types.Receipt
-			var txEvents []ParsedEvent
-			for _, cd := range bh.ContractsData {
-				txInput, err = e.parseTxInputs(tx, cd.ABIInstance)
-				if err != nil {
-					if strings.Contains(err.Error(), "no method with id") {
-						continue
-					}
-					return nil, err
-				}
-				txOutput, err = e.parseTxOutputs(tx, cd.ABIInstance)
-				if err != nil {
-					if strings.Contains(err.Error(), "no method with id") {
-						continue
-					}
-					return nil, err
-				}
-				receipt, err := e.client.TransactionReceipt(context.Background(), tx.Hash())
-				if err != nil {
-					log.Err(err)
-				}
-				txReceipt = receipt
-				log.Debug().Interface("receipt", receipt).Msg("tx receipt")
-				logsValues := make([]types.Log, 0)
-				for _, l := range receipt.Logs {
-					logsValues = append(logsValues, *l)
-				}
-				txEvents, err = e.parseContractEvents(logsValues, cd.ABIInstance, bh)
-				if err != nil {
-					return nil, err
-				}
-				log.Debug().Interface("events", txEvents).Msg("parsed events")
-			}
-			log.Debug().Interface("all_inputs", txInput).Msg("inputs collected")
-			log.Debug().Interface("all_outputs", txOutput).Msg("inputs collected")
-			parsedTx := ParsedTX{
-				Protected: tx.Protected(),
-				Hash:      tx.Hash().String(),
-				Input:     txInput,
-				Output:    txOutput,
-				Receipt:   txReceipt,
-				Events:    txEvents,
-			}
-			parsedTxs = append(parsedTxs, parsedTx)
-		}
-		parsedBlock.Transactions = parsedTxs
-		history.Blocks = append(history.Blocks, parsedBlock)
 	}
-	log.Debug().Interface("history", history).Send()
 	return history, nil
 }
 
@@ -278,11 +345,11 @@ func (e *EthLog) NewFile(name string) *os.File {
 	return f
 }
 
-func (e *EthLog) formatBlob(hr interface{}, bh *HistoryConfig) ([]byte, string, error) {
+func (e *EthLog) formatBlob(hr interface{}, format HistoryFormat) ([]byte, string, error) {
 	var fileSuffix string
 	var blob []byte
 	var err error
-	switch bh.Format {
+	switch format {
 	case FormatJSON:
 		fileSuffix = ".json"
 		blob, err = e.formatPrettyJSON(hr)
@@ -298,18 +365,14 @@ func (e *EthLog) formatBlob(hr interface{}, bh *HistoryConfig) ([]byte, string, 
 	return blob, fileSuffix, nil
 }
 
-func (e *EthLog) DumpBlockHistory(name string, bh *HistoryConfig, hr *History) error {
-	blob, fileSuffix, err := e.formatBlob(hr, bh)
+func (e *EthLog) writeBlockHistory(name string, format HistoryFormat, hr *History) error {
+	blob, fileSuffix, err := e.formatBlob(hr, format)
 	if err != nil {
 		return err
 	}
-	f := e.NewFile(name + fileSuffix)
-	_, err = f.Write(blob)
-	if err != nil {
+	if err := os.WriteFile(name+fileSuffix, blob, os.ModePerm); err != nil {
 		return err
 	}
-	_ = f.Close()
-	log.Debug().Bytes("blob", blob).Send()
 	return nil
 }
 
@@ -319,21 +382,21 @@ func (e *EthLog) DumpEventsByFile(bh *HistoryConfig, eventsByContract [][]Parsed
 			log.Info().Msg("no events to dump")
 			continue
 		}
-		blob, fileSuffix, err := e.formatBlob(events, bh)
+		blob, fileSuffix, err := e.formatBlob(events, bh.Format)
 		if err != nil {
 			return err
 		}
-		f := e.NewFile(events[0].FileTag + "_events" + fileSuffix)
-		if _, err := f.Write(blob); err != nil {
+		if err := os.WriteFile(events[0].FileTag+"_events"+fileSuffix, blob, os.ModePerm); err != nil {
 			return err
 		}
-		_ = f.Close()
-		log.Debug().Bytes("blob", blob).Send()
 	}
 	return nil
 }
 
-func (e *EthLog) ParseParams(bh *HistoryConfig) {
+func (e *EthLog) prepare(bh *HistoryConfig) error {
+	if err := e.SetABI(bh); err != nil {
+		return err
+	}
 	if bh.FromBlock == nil {
 		bh.FromBlock = big.NewInt(0)
 	}
@@ -345,18 +408,11 @@ func (e *EthLog) ParseParams(bh *HistoryConfig) {
 	if bh.ToBlock == nil {
 		bh.ToBlock = big.NewInt(int64(bn))
 	}
-}
-
-func (e *EthLog) prepare(bh *HistoryConfig) error {
-	if err := e.SetABI(bh); err != nil {
-		return err
-	}
-	e.ParseParams(bh)
 	return nil
 }
 
-// RequestEventsHistory parse all events for all contracts
-func (e *EthLog) RequestEventsHistory(bh *HistoryConfig) ([][]ParsedEvent, error) {
+// EventsHistory parse all events for all contracts
+func (e *EthLog) EventsHistory(bh *HistoryConfig) ([][]ParsedEvent, error) {
 	var allEvents [][]ParsedEvent
 	if err := e.prepare(bh); err != nil {
 		return nil, err
@@ -372,7 +428,7 @@ func (e *EthLog) RequestEventsHistory(bh *HistoryConfig) ([][]ParsedEvent, error
 		if err != nil {
 			return allEvents, err
 		}
-		events, err := e.parseContractEvents(logs, d.ABIInstance, bh)
+		events, err := e.parseContractEvents(logs, d.ABIInstance)
 		if err != nil {
 			return allEvents, err
 		}
@@ -395,19 +451,32 @@ func (e *EthLog) parseEventFromLog(a abi.ABI, eventABISpec abi.Event, l types.Lo
 			log.Err(err).Msg("error parsing non indexed data")
 			return nil, nil, err
 		}
+		log.Debug().Interface("Non-indexed", eventsMap).Send()
 	}
-	// might have up to 3 additional index fields
+	// might have up to 3 additional indexed fields
 	if len(l.Topics) > 1 {
+		topics := l.Topics[1:]
 		var indexed []abi.Argument
-		for _, arg := range eventABISpec.Inputs {
+		indexedTopics := make([]common.Hash, 0)
+		for idx, topic := range topics {
+			arg := eventABISpec.Inputs[idx]
 			if arg.Indexed {
 				indexed = append(indexed, arg)
+				indexedTopics = append(indexedTopics, topic)
 			}
 		}
-		err := abi.ParseTopicsIntoMap(topicsMap, indexed, l.Topics[1:])
+		log.Debug().Int("Topics", len(l.Topics[1:])).Int("Arguments", len(indexed)).Send()
+		log.Debug().Interface("AllTopics", l.Topics).Send()
+		log.Debug().Interface("HashOfName", eventABISpec.ID.Hex()).Send()
+		log.Debug().Interface("FirstTopic", l.Topics[0]).Send()
+		log.Debug().Interface("Topics", l.Topics[1:]).Send()
+		log.Debug().Interface("Arguments", eventABISpec.Inputs).Send()
+		log.Debug().Interface("Indexed", indexed).Send()
+		err := abi.ParseTopicsIntoMap(topicsMap, indexed, indexedTopics)
 		if err != nil {
-			return eventsMap, topicsMap, err
+			return nil, nil, err
 		}
+		log.Debug().Interface("Indexed", topicsMap).Send()
 	}
 	return eventsMap, topicsMap, nil
 }
@@ -429,27 +498,26 @@ func (e *EthLog) formatYAML(history interface{}) ([]byte, error) {
 }
 
 // parseContractEvents parses all events related to contract addr
-func (e *EthLog) parseContractEvents(logs []types.Log, a abi.ABI, bh *HistoryConfig) ([]ParsedEvent, error) {
+func (e *EthLog) parseContractEvents(logs []types.Log, a abi.ABI) ([]ParsedEvent, error) {
 	log.Debug().
-		Int64("from_block", bh.FromBlock.Int64()).
-		Int64("to_block", bh.ToBlock.Int64()).
-		Msg("parsing events")
+		Msg("Parsing events")
 	var eventsParsed []ParsedEvent
 	for _, l := range logs {
 		for _, evSpec := range a.Events {
-			sig := crypto.Keccak256Hash([]byte(evSpec.Sig)).Hex()
+			// evSpec.ID.Hex() == crypto.Keccak256Hash([]byte(evSpec.Sig)).Hex() ?
+			// sig := crypto.Keccak256Hash([]byte(evSpec.Sig)).Hex()
 			// first topic is always 4 bytes keccak256 signature
-			if sig == l.Topics[0].Hex() {
-				log.Debug().Str("event_name", evSpec.RawName).Msg("unpacking event")
-				log.Debug().Str("event_sig", evSpec.Sig).Msg("event signature")
+			if evSpec.ID.Hex() == l.Topics[0].Hex() {
+				log.Debug().Str("Name", evSpec.RawName).Str("Signature", evSpec.Sig).Msg("Unpacking event")
 				eventsMap, topicsMap, err := e.parseEventFromLog(a, evSpec, l)
 				if err != nil {
-					log.Err(err)
+					return nil, err
 				}
-				eventParsedMap := mergeEventTopicsMap(eventsMap, topicsMap)
-				e.mergeLogMeta(eventParsedMap, l)
-				eventsParsed = append(eventsParsed, eventParsedMap)
-				log.Debug().Interface("event_map", eventParsedMap).Msg("event")
+				parsedEvent := mergeEventTopicsMap(eventsMap, topicsMap)
+				parsedEvent.Signature = evSpec.Sig
+				e.mergeLogMeta(&parsedEvent, l)
+				eventsParsed = append(eventsParsed, parsedEvent)
+				log.Debug().Interface("Event", parsedEvent).Msg("Parsed event map")
 			}
 		}
 	}
