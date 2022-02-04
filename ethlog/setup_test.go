@@ -3,32 +3,16 @@ package ethlog
 import (
 	"context"
 	"crypto/ecdsa"
+	"math/big"
+
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 	"github.com/skudasov/ethlog/another_events_test_contract"
 	"github.com/skudasov/ethlog/events_test_contract"
-	"math/big"
 )
-
-func NewLocalHardhatDeploySuite() *SimulatedBackendSuite {
-	privateKey, err := crypto.HexToECDSA("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
-	if err != nil {
-		log.Fatal().Err(err)
-	}
-	client, err := ethclient.Dial("ws://localhost:8545")
-	if err != nil {
-		log.Fatal().Err(err)
-	}
-	return &SimulatedBackendSuite{
-		RootPrivateKey: privateKey,
-		Client:         client,
-		Auth:           nil,
-	}
-}
 
 func txOpts(client EthClient, fromAddress common.Address, privateKey *ecdsa.PrivateKey) *bind.TransactOpts {
 	log.Debug().Str("addr", fromAddress.Hex()).Send()
